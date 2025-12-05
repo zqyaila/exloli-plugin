@@ -28,11 +28,112 @@ export class Search extends plugin {
             e.reply(NOT_MASTER_REPLY);
             return true;
         }
+        
+        e.reply(`请输入搜索参数，用空格分隔（可直接复制粘贴）：
+
+格式：关键词1,关键词2... 漫画类型序号 星级 是否里站
+示例：
+1. 默认设置：默认
+2. 仅关键词：萝莉 原神
+3. 完整示例：萝莉 1,2,4 3 是
+
+详细参数说明：
+📝 关键词：用逗号分隔，空关键词填"无"或直接留空
+📂 漫画类型：用逗号分隔序号，不填或"默认"则默认全选
+   1.同人 2.漫画 3.美术CG 4.游戏CG 5.欧美 6.无H 7.图集 8.Coser 9.亚洲 10.杂项
+⭐ 星级：0-5，不填或"默认"则为0
+🏠 里站：是/否，不填默认为否
+
+回复示例：
+"萝莉,原神 1,2,4 3 是"
+"默认"
+"美少女 无H 2 否"`);
+        
         const userId = e.user_id;
         const defaultParam = { step: 0 };
         await redis.set(USER_SEARCH_PARAM_KEY + userId, JSON.stringify(defaultParam), { EX: SEARCH_TIMEOUT });
-        e.reply("请输入你要搜索的词条，并用“,”分隔\n1.如不需要请填“无”,\n2.采用默认设置可回复“默认”");
-        this.setContext("getInfo", e.isGroup, SEARCH_TIMEOUT, "操作已超时，请重新发送指令");
+        this.setContext("parseSearchParams", e.isGroup, SEARCH_TIMEOUT, "操作已超时，请重新发送指令");
+        return true;
+    }
+
+    async parseSearchParams() {
+        const userId = this.e.user_id;
+        const paramKey = USER_SEARCH_PARAM_KEY + userId;
+        const cachedParam = await redis.get(paramKey);
+        if (!cachedParam) {
+            this.finish("parseSearchParams", this.e.isGroup);
+            return this.e.reply("搜索参数已过期，请重新发送 #exloli搜索");
+        }
+
+        const userParam = JSON.parse(cachedParam);
+        const msg = this.e.msg.trim();
+
+        try {
+            // 解析参数：关键词 漫画类型 星级 是否里站
+            let [keywordsStr, categoryStr, starStr, exStr] = msg.split(/\s+/).map(s => s.trim());
+
+            // 处理默认情况
+            if (msg.includes("默认") || msg === "") {
+                userParam.search_param = [];
+                userParam.category = {};
+                userParam.f_srdd = 0;
+                userParam.isEx = false;
+            } else {
+                // 解析关键词
+                if (!keywordsStr || keywordsStr === "无") {
+                    userParam.search_param = [""];
+                } else {
+                    userParam.search_param = keywordsStr.split(/[，,]/).map(s => s.trim()).filter(Boolean);
+                }
+
+                // 解析漫画类型
+                if (!categoryStr || categoryStr === "默认") {
+                    userParam.category = {};
+                } else if (categoryStr === "全选") {
+                    userParam.category = Object.fromEntries(Object.values(CATEGORY).map(key => [key, true]));
+                } else {
+                    userParam.category = Object.fromEntries(Object.values(CATEGORY).map(key => [key, false]));
+                    const numbers = categoryStr.split(/[，,]/).map(s => s.trim());
+                    numbers.forEach(num => {
+                        const numVal = parseInt(num);
+                        if (!isNaN(numVal) && numVal >= 1 && numVal <= 10 && CATEGORY[numVal]) {
+                            userParam.category[CATEGORY[numVal]] = true;
+                        }
+                    });
+                }
+
+                // 解析星级
+                if (!starStr || starStr === "默认") {
+                    userParam.f_srdd = 0;
+                } else {
+                    const star = parseInt(starStr);
+                    userParam.f_srdd = (!isNaN(star) && star >= 0 && star <= 5) ? star : 0;
+                }
+
+                // 解析里站
+                userParam.isEx = exStr === "是" || exStr === "yes" || exStr === "true";
+            }
+
+            // 执行搜索
+            this.finish("parseSearchParams", this.e.isGroup);
+            await redis.del(paramKey);
+            
+            await this.e.reply("正在为您搜索中喵~");
+            const exClient = new ExClient(userParam.isEx);
+            const page = await exClient.requestPage(exClient.handleParam(userParam));
+            
+            if (page.comicList.length === 0) {
+                await this.e.reply("未搜索到结果喵~");
+            } else {
+                await redis.set(USER_SEARCH_PARAM_KEY + userId + ':page', JSON.stringify(page), { EX: 3600 });
+                this.e.reply(Bot.makeForwardMsg(this.createPageMessage(page.comicList)));
+            }
+            
+        } catch (error) {
+            await this.e.reply(`参数解析出错，请检查格式：
+示例："萝莉,原神 1,2,4 3 是"
+或回复"默认"使用默认设置`);
+        }
     }
 
     async changePage(e) {
@@ -74,92 +175,16 @@ export class Search extends plugin {
         return true;
     }
 
-    async getInfo() {
-        const userId = this.e.user_id;
-        const paramKey = USER_SEARCH_PARAM_KEY + userId;
-        const cachedParam = await redis.get(paramKey);
-        if (!cachedParam) {
-            this.finish("getInfo", this.e.isGroup);
-            return this.e.reply("搜索参数已过期，请重新发送 #exloli搜索");
-        }
-        const userParam = JSON.parse(cachedParam);
-
-        switch (userParam.step) {
-            case 0:
-                if (this.e.msg.includes("默认")) {
-                    userParam.search_param = [];
-                } else if (this.e.msg.includes("无")) {
-                    userParam.search_param = [''];
-                } else {
-                    userParam.search_param = this.e.msg.split(/[，,]/);
-                }
-                userParam.step = 1;
-                await redis.set(paramKey, JSON.stringify(userParam), { EX: SEARCH_TIMEOUT });
-                await this.e.reply("请输入你要搜索的漫画类型\n1.全选可回复“全选”\n2.采用默认设置可回复“默认”\n3.如需要特定词条请回复数字序号并用“,”分隔\n\n\
-1.同人 2.漫画 3.美术CG\n4.游戏CG 5.欧美 6.无H\n7.图集 8.Coser 9.亚洲\n10.杂项");
-                break;
-            case 1:
-                if (this.e.msg.includes("默认")) {
-                    userParam.category = {};
-                } else if (this.e.msg.includes("全选")) {
-                    userParam.category = Object.fromEntries(Object.values(CATEGORY).map(key => [key, true]));
-                } else {
-                    userParam.category = Object.fromEntries(Object.values(CATEGORY).map(key => [key, false]));
-                    const numbers = this.e.msg.trim().split(/[，,]/);
-                    numbers.forEach(element => {
-                        if (CATEGORY.hasOwnProperty(element)) {
-                            userParam.category[CATEGORY[element]] = true;
-                        }
-                    });
-                }
-                userParam.step = 2;
-                await redis.set(paramKey, JSON.stringify(userParam), { EX: SEARCH_TIMEOUT });
-                await this.e.reply("请输入最低星级0-5\n1.如采用默认设置可回复“默认”");
-                break;
-            case 2:
-                if (!this.e.msg.includes("默认")) {
-                    const star = Number(this.e.msg);
-                    if (!isNaN(star) && star <= 5 && star >= 0) {
-                        userParam.f_srdd = Math.floor(star);
-                    } else {
-                        await this.e.reply("星级输入有误，请重新输入或回复“默认”");
-                        return;
-                    }
-                } else {
-                    userParam.f_srdd = 0;
-                }
-                userParam.step = 3;
-                await redis.set(paramKey, JSON.stringify(userParam), { EX: SEARCH_TIMEOUT });
-                await this.e.reply("是否使用里站\n1.是请回复“是”");
-                break;
-            case 3:
-                userParam.isEx = this.e.msg === "是";
-                userParam.step = -1;
-                await redis.set(paramKey, JSON.stringify(userParam), { EX: SEARCH_TIMEOUT });
-                break;
-        }
-
-        if (userParam.step === -1) {
-            this.finish("getInfo", this.e.isGroup);
-            await this.e.reply("正在为您搜索中");
-            const exClient = new ExClient(userParam.isEx);
-            const page = await exClient.requestPage(exClient.handleParam(userParam));
-            if (page.comicList.length === 0) {
-                await this.e.reply("未搜索到结果");
-            } else {
-                await redis.set(USER_SEARCH_PARAM_KEY + userId + ':page', JSON.stringify(page), { EX: 3600 });
-                this.e.reply(Bot.makeForwardMsg(this.createPageMessage(page.comicList)));
-            }
-            await redis.del(paramKey);
-        }
-    }
-
     createPageMessage(comicList) {
         const message = [];
         comicList.forEach((comic, index) => {
-            message.push({ message: `${index + 1}. 标题：${comic.title}\n页数：${comic.pages}\n上传时间：${comic.posted}\n原始地址：${comic.link}` });
+            message.push({ 
+                message: `${index + 1}. 标题：${comic.title}\n页数：${comic.pages}\n上传时间：${comic.posted}\n原始地址：${comic.link}` 
+            });
         });
-        message.push({ message: "查看当前页指定内容:\n“exloli推送1”\n切换页:\n“exloli第一页”，\n“exloli上一页”，\n“exlolo下一页”，\n“exloli最后一页”" });
+        message.push({ 
+            message: `查看当前页指定内容:\n"exloli推送1"\n切换页:\n"exloli第一页"，"exloli上一页"，"exloli下一页"，"exloli最后一页"` 
+        });
         return message;
     }
 }
